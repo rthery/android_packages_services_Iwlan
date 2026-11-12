@@ -99,6 +99,7 @@ import com.google.android.iwlan.proto.MetricsAtom;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -172,6 +173,7 @@ public class EpdgTunnelManager {
 
     // "192.0.2.0" is selected from RFC5737, "IPv4 Address Blocks Reserved for Documentation"
     private static final InetAddress DUMMY_ADDR = InetAddresses.parseNumericAddress("192.0.2.0");
+    private static final int IKE_NATT_PORT = 4500;
 
     private static final Map<Integer, EpdgTunnelManager> mTunnelManagerInstances =
             new ConcurrentHashMap<>();
@@ -943,14 +945,32 @@ public class EpdgTunnelManager {
         }
     }
 
-    private IpSecManager.IpSecTunnelInterface tryCreateIpSecTunnelInterface() {
+    private IpSecManager.IpSecTunnelInterface tryCreateIpSecTunnelInterface(
+            InetAddress epdgAddress) {
+        // XFRM interfaces ignore the endpoints, but VTI matches them against the SA addresses.
+        InetAddress localAddress = getTunnelLocalAddress(epdgAddress);
+        InetAddress remoteAddress = localAddress == DUMMY_ADDR ? DUMMY_ADDR : epdgAddress;
         try {
             return mIpSecManager.createIpSecTunnelInterface(
-                    DUMMY_ADDR /* unused */, DUMMY_ADDR /* unused */, mDefaultNetwork);
+                    localAddress, remoteAddress, mDefaultNetwork);
         } catch (IpSecManager.ResourceUnavailableException | IOException e) {
             Log.e(TAG, "Failed to create tunnel interface. " + e);
             return null;
         }
+    }
+
+    private InetAddress getTunnelLocalAddress(InetAddress epdgAddress) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            mDefaultNetwork.bindSocket(socket);
+            socket.connect(epdgAddress, IKE_NATT_PORT);
+            InetAddress localAddress = socket.getLocalAddress();
+            if (localAddress != null && !localAddress.isAnyLocalAddress()) {
+                return localAddress;
+            }
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "No local address towards ePDG " + epdgAddress + ": " + e);
+        }
+        return DUMMY_ADDR;
     }
 
     private void onBringUpTunnel(
@@ -979,7 +999,7 @@ public class EpdgTunnelManager {
             return;
         }
 
-        iface = tryCreateIpSecTunnelInterface();
+        iface = tryCreateIpSecTunnelInterface(epdgAddress);
         if (Objects.isNull(iface)) {
             IwlanError iwlanError = new IwlanError(IwlanError.TUNNEL_TRANSFORM_FAILED);
             reportIwlanError(apnName, iwlanError);
