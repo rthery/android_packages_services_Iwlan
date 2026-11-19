@@ -72,6 +72,7 @@ import android.os.HandlerExecutor;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
+import android.os.PowerManager;
 import android.support.annotation.IntDef;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
@@ -120,9 +121,12 @@ import java.util.concurrent.TimeUnit;
 public class EpdgTunnelManager {
     private final FeatureFlags mFeatureFlags;
     private final Context mContext;
+    @Nullable private final PowerManager.WakeLock mTunnelClosedWakeLock;
     private final int mSlotId;
     private Handler mHandler;
     private ConnectivityDiagnosticsCallback mConnectivityDiagnosticsCallback;
+
+    private static final long TUNNEL_CLOSED_WAKE_LOCK_TIMEOUT_MS = 5000;
 
     private static final int EVENT_TUNNEL_BRINGUP_REQUEST = 0;
     private static final int EVENT_TUNNEL_BRINGDOWN_REQUEST = 1;
@@ -514,6 +518,7 @@ public class EpdgTunnelManager {
         @Override
         public void onClosed() {
             Log.d(TAG, "Ike session closed for apn: " + mApnName + " with token: " + mToken);
+            holdWakeLockForTunnelClosed();
             mHandler.obtainMessage(
                             EVENT_IKE_SESSION_CLOSED,
                             new SessionClosedData(mApnName, mToken, null /* ikeException */))
@@ -523,6 +528,7 @@ public class EpdgTunnelManager {
         @Override
         public void onClosedWithException(IkeException exception) {
             mNextReauthId = null;
+            holdWakeLockForTunnelClosed();
             onSessionClosedWithException(exception, mApnName, mToken, EVENT_IKE_SESSION_CLOSED);
         }
 
@@ -720,6 +726,15 @@ public class EpdgTunnelManager {
         mFeatureFlags = featureFlags;
         mIkeSessionCreator = ikeSessionCreator;
         mIpSecManager = mContext.getSystemService(IpSecManager.class);
+        PowerManager powerManager = mContext.getSystemService(PowerManager.class);
+        mTunnelClosedWakeLock =
+                powerManager == null
+                        ? null
+                        : powerManager.newWakeLock(
+                                PowerManager.PARTIAL_WAKE_LOCK, "Iwlan:TunnelClosed");
+        if (mTunnelClosedWakeLock != null) {
+            mTunnelClosedWakeLock.setReferenceCounted(false);
+        }
         // Adding this here is necessary because we need to initialize EpdgSelector at the beginning
         // to ensure no broadcasts are missed.
         mEpdgSelector = epdgSelector;
@@ -1891,6 +1906,13 @@ public class EpdgTunnelManager {
                 .setEapAkaConfig(subId, TelephonyManager.APPTYPE_USIM, option)
                 .setEapIdentity(nai.getBytes(StandardCharsets.US_ASCII))
                 .build();
+    }
+
+    // The close is passed through handlers to telephony, which do not run while suspended.
+    private void holdWakeLockForTunnelClosed() {
+        if (mTunnelClosedWakeLock != null) {
+            mTunnelClosedWakeLock.acquire(TUNNEL_CLOSED_WAKE_LOCK_TIMEOUT_MS);
+        }
     }
 
     private void onSessionClosedWithException(
